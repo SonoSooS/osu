@@ -51,7 +51,7 @@ namespace osu.Game.Rulesets.Osu.Replays
                 
                 if(frame.IsSpinnerStart)
                 {
-                    isLeft = !isLeft ?? true;
+                    isLeft = isLeft ?? true;
                     isSpinning = true;
                     
                     // Do not process spinner start event any further, as
@@ -62,6 +62,8 @@ namespace osu.Game.Rulesets.Osu.Replays
                     
                 if(isSpinning)
                 {
+                    isLeft = isLeft ?? true;
+                    
                     double timeStart = lastFrame.Time;
                     double timeEnd = frame.Time;
                     
@@ -69,7 +71,7 @@ namespace osu.Game.Rulesets.Osu.Replays
                     {
                         AddFrameToReplay(new OsuReplayFrame(timeStart, CirclePosition(timeStart, 3) + SPINNER_CENTRE, ToAction(isLeft)));
                         
-                        timeStart += 1;
+                        timeStart += 5;
                     }
                 }
                 
@@ -86,15 +88,14 @@ namespace osu.Game.Rulesets.Osu.Replays
                 {
                     AddFrameToReplay(new OsuReplayFrame(lastFrame.Time + 50, lastFrame.Position));
                     isLeft = null;
+                    canRelease = false;
                 }
                 
-                
-                if(frame.IsEngage || (frame.IsHold && !isLeft.HasValue))
+                if(frame.IsEngage || (!isLeft.HasValue && frame.IsHold))
                 {
                     isLeft = !isLeft ?? true;
                     canRelease = false;
                 }
-                
                 
                 if(frame.IsRelease || (frame.IsCircleHit && !frame.IsHold))
                 {
@@ -153,17 +154,17 @@ namespace osu.Game.Rulesets.Osu.Replays
             //HACK: remove the extra loop after the refactor
             for(int _homIndex = 0; _homIndex <= homCount; _homIndex++)
             {
-                HitObject hitObject;
+                OsuHitObject hitObject;
                 double time;
                 
                 if(_homIndex != homCount)
                 {
-                    hitObject = hitObjects[_homIndex];
+                    hitObject = (OsuHitObject)hitObjects[_homIndex];
                     time = hitObject.StartTime;
                 }
                 else
                 {
-                    hitObject = hitObjects[homCount - 1];
+                    hitObject = (OsuHitObject)hitObjects[homCount - 1];
                     
                     if(hitObject is OsuSlider endSlider)
                         time = endSlider.EndTime + 1;
@@ -217,63 +218,30 @@ namespace osu.Game.Rulesets.Osu.Replays
                             double lastTime = tracker.NextUpdateTime;
                             Vector2 lastPos = tracker.NextPosition;
                             
+                            AddFrame(frames, new AbstractEventFrame()
+                            {
+                                Time = lastTime,
+                                Position = lastPos,
+                                
+                                IsSliderTick = true,
+                                IsSliderSlide = true
+                            });
+                            
                             if(tracker.UpdateNextTime()) // Slider still has remaining ticks
                             {
-                                AddFrame(frames, new AbstractEventFrame()
-                                {
-                                    Time = lastTime,
-                                    Position = lastPos,
-                                    
-                                    IsSliderTick = true,
-                                    IsSliderSlide = true
-                                });
-                                
                                 //TODO: add slider following if this is the only slider
                             }
                             else // Slider is out of ticks, end it
                             {
-                                if(tracker.Slider.LegacyLastTickOffset.HasValue && tracker.Slider.LegacyLastTickOffset > 0)
-                                {
-                                    double timeLength = tracker.Slider.EndTime - tracker.Slider.StartTime;
-                                    double progress = (timeLength - tracker.Slider.LegacyLastTickOffset.Value) / timeLength;
-                                    
-                                    if(progress < 0.5)
-                                        progress = 0.5; // Max(timeLength / 2, timeLength - 36)
-                                    
-                                    {
-                                        Vector2 posAtTime;
-                                        if(tracker.Slider.RepeatCount % 2 == 0)
-                                            posAtTime = tracker.Slider.Path.PositionAt(progress) + tracker.Slider.StackedPosition;
-                                        else
-                                            posAtTime = tracker.Slider.Path.PositionAt(1.0 - progress) + tracker.Slider.StackedPosition;
-                                        
-                                        AddFrame(frames, new AbstractEventFrame()
-                                        {
-                                            Time = tracker.Slider.StartTime + (timeLength * progress),
-                                            Position = posAtTime,
-                                            
-                                            IsSliderTick = true,
-                                            IsSliderSlide = true
-                                        });
-                                    }
-                                }
-                                
-                                /*AddFrame(frames, new AbstractSyntaxFrame()
-                                {
-                                    Time = lastTime,
-                                    Position = lastPos,
-                                    
-                                    IsSliderEnd = true
-                                });*/
-                                
-                                //if(lastTime != tracker.Slider.EndTime)e
+                                if(lastTime < tracker.NextUpdateTime)
                                 {
                                     AddFrame(frames, new AbstractEventFrame()
                                     {
                                         Time = tracker.Slider.EndTime,
                                         Position = tracker.Slider.StackedEndPosition,
                                         
-                                        IsSliderEnd = true
+                                        IsSliderEnd = true,
+                                        IsSliderTick = true // Workaround for weird misses
                                     });
                                 }
                                 
@@ -303,7 +271,7 @@ namespace osu.Game.Rulesets.Osu.Replays
                         lastSliderTime = null;
                 }
                 
-                if(hitObject is null)
+                if(hitObject == null)
                     break;
                 
                 if(hitObject is OsuSpinner spinner)
@@ -331,6 +299,7 @@ namespace osu.Game.Rulesets.Osu.Replays
                     continue;
                 }
                 
+                
                 if(hitObject is OsuSlider slider)
                 {
                     sliders.Add(new SliderTracker(slider));
@@ -342,7 +311,9 @@ namespace osu.Game.Rulesets.Osu.Replays
                         
                         IsCircleHit = true,
                         IsSliderSlide = true,
-                        IsSliderTick = true // Entry tick
+                        IsSliderTick = true, // Entry tick,
+                        
+                        Combo = _homIndex//hitObject.IndexInCurrentCombo + 1
                     });
                     
                     if(!lastSliderTime.HasValue)
@@ -354,9 +325,11 @@ namespace osu.Game.Rulesets.Osu.Replays
                 AddFrame(frames, new AbstractEventFrame()
                 {
                     Time = hitObject.StartTime,
-                    Position = ((OsuHitObject)hitObject).StackedPosition, //HACK: this is nasty
+                    Position = hitObject.StackedPosition, //HACK: this is nasty
                     
-                    IsCircleHit = true
+                    IsCircleHit = true,
+                    
+                    Combo = _homIndex//hitObject.IndexInCurrentCombo + 1
                 });
             }
             
@@ -395,7 +368,6 @@ namespace osu.Game.Rulesets.Osu.Replays
                 if(currentFrameRef.IsSliderEnd)
                     --sliderCount;
                 
-                
                 if(sliderCount != 0)
                 {
                     currentFrameRef.IsSliderSlide = true;
@@ -412,8 +384,14 @@ namespace osu.Game.Rulesets.Osu.Replays
             public double NextUpdateTime;
             public Vector2 NextPosition;
             
+            private readonly double? LegacyScoringTime;
+            private readonly Vector2? LegacyScoringPos;
+            private bool HasSentLegacyScoringPos = false;
+            
             private int UpdateIndex;
             private readonly Vector2 PositionOffset;
+            
+            
             
             public SliderTracker(OsuSlider slider)
             {
@@ -421,12 +399,38 @@ namespace osu.Game.Rulesets.Osu.Replays
                 
                 this.UpdateIndex = 0;
                 this.NextUpdateTime = slider.StartTime;
-                this.NextPosition = default;
+                this.NextPosition = slider.StackedPosition;
                 
+                // Slider ticks are stored as Position, but for gameplay we need StackedPosition
                 this.PositionOffset = slider.StackedPosition - slider.Position;
                 
-                if(!UpdateNextTime())
-                    throw new Exception("Slider not initialized");
+                if(Slider.LegacyLastTickOffset.HasValue && Slider.LegacyLastTickOffset.Value > 0)
+                {
+                    double timeLength = Slider.EndTime - Slider.StartTime;
+                    double progress = (timeLength - Slider.LegacyLastTickOffset.Value) / timeLength;
+                    
+                    if(progress < 0.5)
+                        progress = 0.5; // Max(timeLength / 2, timeLength - 36)
+                    
+                    Vector2 posAtTime;
+                    /*
+                    if(Slider.RepeatCount % 2 == 0)
+                        posAtTime = Slider.Path.PositionAt(progress) + Slider.StackedPosition;
+                    else
+                        posAtTime = Slider.Path.PositionAt(1.0 - progress) + Slider.StackedPosition;
+                    */
+                    
+                    posAtTime = Slider.StackedPositionAt(progress);
+                    
+                    
+                    LegacyScoringTime = Slider.StartTime + (timeLength * progress);
+                    LegacyScoringPos = posAtTime;
+                }
+                else
+                {
+                    LegacyScoringTime = null;
+                    LegacyScoringPos = null;
+                }
             }
             
             public bool UpdateNextTime()
@@ -434,23 +438,71 @@ namespace osu.Game.Rulesets.Osu.Replays
                 while(true)
                 {
                     if(++UpdateIndex >= Slider.NestedHitObjects.Count)
-                        return false;
-                    
-                    HitObject childHom = Slider.NestedHitObjects[UpdateIndex];
-                    
-                    if
-                    (
-                        childHom is SliderTick ||
-                        childHom is SliderRepeat ||
-                        childHom is SliderTailCircle
-                    )
                     {
-                        NextUpdateTime = childHom.StartTime;
-                        NextPosition = ((OsuHitObject)childHom).Position; //HACK: this is nasty
+                        if(LegacyScoringTime.HasValue && !HasSentLegacyScoringPos)
+                        {
+                            // Prevent infinite looping
+                            HasSentLegacyScoringPos = true;
+                        }
+                        else
+                        {
+                            NextUpdateTime = Slider.EndTime;
+                            NextPosition = Slider.StackedEndPosition;
+                            
+                            return false;
+                        }
+                    }
+                    
+                    HitObject childHom;
+                    double homTime;
+                    Vector2 homPos;
+                    
+                    if(UpdateIndex < Slider.NestedHitObjects.Count)
+                    {
+                        childHom = Slider.NestedHitObjects[UpdateIndex];
+                        
+                        if(childHom is SliderTick || childHom is SliderRepeat)
+                        {
+                            homTime = childHom.StartTime;
+                            homPos = ((OsuHitObject)childHom).Position + PositionOffset; //HACK: this is nasty
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        childHom = null;
+                        
+                        homTime = Slider.EndTime;
+                        homPos = Slider.StackedEndPosition;
+                    }
+                    
+                    
+                    if(LegacyScoringTime.HasValue)
+                    {
+                        if(LegacyScoringTime.Value > NextUpdateTime &&
+                            homTime > LegacyScoringTime.Value)
+                        {
+                            --UpdateIndex;
+                            
+                            NextUpdateTime = LegacyScoringTime.Value;
+                            NextPosition = LegacyScoringPos.Value;
+                            
+                            HasSentLegacyScoringPos = true;
+                            
+                            return true;
+                        }
+                    }
+                    
+                    if(childHom != null)
+                    {
+                        NextUpdateTime = homTime;
+                        NextPosition = homPos;
                         
                         return true;
                     }
-                    
                 }
             }
         }
@@ -473,9 +525,13 @@ namespace osu.Game.Rulesets.Osu.Replays
             public bool IsSpinnerStart = false;
             public bool IsSpinnerEnd = false;
             
+            public int Combo = 0;
+            
             //FIXME: there is a slider end miss when same-frame hit circle happens
             int IComparable<AbstractEventFrame>.CompareTo(AbstractEventFrame other)
             {
+                // Frames are sorted by time first
+                
                 if(this.Time > other.Time)
                     return 1;
                 
@@ -483,10 +539,38 @@ namespace osu.Game.Rulesets.Osu.Replays
                     return -1;
                 
                 // Spinners have the highest priority, as we want them to be
-                //  on the last frame of the time collision, so
+                //  on the first frame of the time collision, so
                 //  the spinner is actually getting spinned
                 if(this.IsSpinnerStart != other.IsSpinnerStart)
-                    return this.IsSpinnerStart ? 1 : -1;
+                    return this.IsSpinnerStart ? -1 : 1; // [!] Inverted [!] (start events come first)
+                
+                // Circle hit should come first, as
+                //  holding is more important than a zero-frame click
+                if(this.IsCircleHit != other.IsCircleHit)
+                    return this.IsCircleHit ? -1 : 1; // [!] Inverted [!] (click events are lower prio than slider hold)
+                
+                // Workaround for Classic mode: same-frame clicks must be sorted by combo due to note lock
+                
+                if(this.Combo != other.Combo)
+                {
+                    // Combo index of zero should come last in the chain.
+                    // Due to the check to this if case,
+                    //  it's guaranteed that only one of the compared frames could contain a zero
+                    
+                    if(this.Combo == 0) // Other frame is non-zero index
+                        return 1;       // Zero combo comes last, we're "bigger"
+                    
+                    if(other.Combo == 0) // We have non-zero combo index, we come first
+                        return -1; // Zero comes last, so we come first instead
+                    
+                    // Neither combos are zero, so just order them normally
+                    
+                    if(this.Combo > other.Combo)
+                        return 1;
+                    
+                    if(this.Combo < other.Combo)
+                        return -1;
+                }
                 
                 // Slider tick and slider end have the same priority
                 
@@ -502,14 +586,9 @@ namespace osu.Game.Rulesets.Osu.Replays
                 
                 // Spinner end has the lowest priority, as
                 //  everything before it requires a key hold anyway.
-                // Its priority is also inverted, so a spinner end gets placed last.
+                // Its priority is also normal, so a spinner end gets placed last.
                 if(this.IsSpinnerEnd != other.IsSpinnerEnd)
-                    return this.IsSpinnerEnd ? -1 : 1; // [!] Inverted [!]
-                
-                // Circle hit order really doesn't matter,
-                //  but it has to be implemented for compliance sake
-                if(this.IsCircleHit != other.IsCircleHit)
-                    return this.IsCircleHit ? 1 : -1;
+                    return this.IsSpinnerEnd ? 1 : -1;
                 
                 // Should only happen on circle spam
                 return 0;
@@ -517,7 +596,39 @@ namespace osu.Game.Rulesets.Osu.Replays
 
             public override string ToString()
             {
-                return "{" + Time + ",\t" + Position + "\t|\t" + string.Join(",\t", new[] {IsCircleHit, IsSliderSlide, IsSliderTick, IsSliderEnd, IsSpinnerStart, IsSpinnerEnd}.Select(b => b.ToString())) + "}";
+                int action = 0;
+                
+                if(IsCircleHit)
+                    action |= 1;
+                if(IsSliderSlide)
+                    action |= 2;
+                if(IsSliderTick)
+                    action |= 4;
+                if(IsSliderEnd)
+                    action |= 8;
+                if(IsSpinnerStart)
+                    action |= 16;
+                if(IsSpinnerEnd)
+                    action |= 32;
+                
+                string actionStr = null;
+                
+                switch(action)
+                {
+                    case 0: actionStr = "NOP"; break;
+                    case 1: actionStr = "CircleHit"; break;
+                    case 7: actionStr = "SliderStart"; break;
+                    case 2: actionStr = "SliderSlide"; break;
+                    case 6: actionStr = "SliderTick"; break;
+                    case 12: actionStr = "SliderEnd"; break;
+                    case 16: actionStr = "SpinnerStart"; break;
+                    case 32: actionStr = "SpinnerEnd"; break;
+                    
+                    default:
+                        return "{" + Time + ",\t" + Position + "\t" + Combo + "\t|\t" + string.Join(",\t", new[] {IsCircleHit, IsSliderSlide, IsSliderTick, IsSliderEnd, IsSpinnerStart, IsSpinnerEnd}.Select(b => b.ToString())) + "}";
+                }
+                
+                return "{" + Time + ", \t" + Position + "\t" + Combo + "\t|\t" + actionStr + "}";
             }
         }
     }

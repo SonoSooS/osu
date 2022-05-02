@@ -6,6 +6,7 @@ using osu.Game.Replays;
 using osu.Game.Rulesets.Objects;
 using osu.Game.Rulesets.Osu.Objects;
 using osu.Game.Rulesets.Mods;
+using osu.Game.Rulesets.Replays;
 using osu.Game.Rulesets.Osu.Replays;
 using osuTK;
 
@@ -21,8 +22,53 @@ namespace osu.Game.Rulesets.Osu.Replays
 {
     public class OsuAutoGeneratorATE : OsuAutoGeneratorBase
     {
+        #region Constants
+        /// <summary>
+        /// Reaction time to unfollow a slider if a hit object comes on during a slider slide
+        /// </summary>
+        protected const double SLIDER_UNFOLLOW_TIMEOUT = 150;
+        
+        /// <summary>
+        /// Slider follow point generation sampling rate.
+        /// High sampling rate increase generation time, but
+        ///  low sampling rate reduces following accuracy (makes jagged lines instead of smooth curves)
+        /// </summary>
+        protected const double SLIDER_FOLLOW_TICKS = 1000.0 / 60;
+        #endregion
+        
+        #region Config
+        /// <summary>
+        /// Enforce strict slider following if the slider is not interrupted during its slide.
+        /// If not enabled, only the necessary slider points are hit.
+        /// </summary>
         public bool ConfigFollowSlider = true;
         
+        /// <summary>
+        /// Only release the held button after this much time has elapsed,
+        ///  and there are no hit objects within that timeframe
+        /// </summary>
+        public double ConfigReleaseWait = 350;
+        /// <summary>
+        /// If releasing the held button is possible, keep holding it for this much before it's released
+        /// </summary>
+        public double ConfigReleaseDelay = 120;
+        /// <summary>
+        /// Amount of time before the next hit object is "noticed"
+        /// </summary>
+        public double ConfigReactionTime = 150;
+        /// <summary>
+        /// If the waiting time between the last object and the next one is less than this value, then
+        ///  special control points are added to prevent any interpolation from freaking out
+        /// </summary>
+        public double ConfigReactionAntiRebindTime = 180;
+        /// <summary>
+        /// The amount of time between two control points.
+        /// Smaller values stop the cursor faster.
+        /// </summary>
+        public double ConfigReactionAntiRebindOffset = 50;
+        #endregion
+        
+        #region Constructor and base class stuff
         public OsuAutoGeneratorATE(IBeatmap beatmap, IReadOnlyList<Mod> mods)
             : base(beatmap, mods)
         {
@@ -34,31 +80,75 @@ namespace osu.Game.Rulesets.Osu.Replays
             if (Beatmap.HitObjects.Count == 0)
                 return Replay;
             
+            //HACK: there has to be a better way to get scaled difficulty values
+            {
+                OsuHitObject firstRealObject = Beatmap.HitObjects.Cast<OsuHitObject>().FirstOrDefault(obj => obj is OsuCircle || obj is OsuSlider);
+                
+                if(firstRealObject != null)
+                {
+                    if(ConfigReactionTime < 0)
+                        ConfigReactionTime = -ConfigReactionTime * firstRealObject.TimePreempt;
+                }
+                else
+                {
+                    if(ConfigReactionTime < 0)
+                        ConfigReactionTime = 100;
+                }
+            }
+            
             List<AbstractEventFrame> frames = GenerateTree();
             if(frames.Count == 0)
                 return Replay;
             
+            TreeToReplay(frames);
+            
+            return Replay;
+        }
+        #endregion
+        
+        #region Child class helpers
+        public List<OsuReplayFrame> BackupAndClearReplay()
+        {
+            List<OsuReplayFrame> originalReplay = new List<OsuReplayFrame>(Frames.Count);
+            originalReplay.AddRange(Frames.Cast<OsuReplayFrame>());
+            
+            Frames.Clear();
+            
+            return originalReplay;
+        }
+        
+        public void RestoreBaseReplay(List<OsuReplayFrame> frames)
+        {
+            Frames.Clear();
+            
+            Frames.AddRange(frames);
+        }
+        
+        public void RestoreGeneratedReplay(List<OsuReplayFrame> frames)
+        {
+            int frameCount = frames.Count;
+            
+            for(int i = 0; i < frameCount; i++)
+                AddFrameToReplay(frames[i]);
+        }
+        #endregion
+        
+        #region Basic replay generator
+        protected virtual void TreeToReplay(List<AbstractEventFrame> frames)
+        {
             bool? isLeft = null;
             bool canRelease = false;
             
             bool isSpinning = false;
             
             AbstractEventFrame lastFrame = frames[0];
+            AddFrameToReplay(new OsuReplayFrame(lastFrame.Time, lastFrame.Position));
+            
+            Vector2 lastNonSpinnerPos = SPINNER_CENTRE;
             
             for(int i = 1; i < frames.Count; i++)
             {
                 AbstractEventFrame frame = frames[i];
-                
-                if(frame.IsSpinnerStart)
-                {
-                    isLeft = isLeft ?? true;
-                    isSpinning = true;
-                    
-                    // Do not process spinner start event any further, as
-                    //  the position field is invalid
-                    lastFrame = frame;
-                    continue;
-                }
                     
                 if(isSpinning)
                 {
@@ -69,10 +159,61 @@ namespace osu.Game.Rulesets.Osu.Replays
                     
                     while(timeStart < timeEnd)
                     {
-                        AddFrameToReplay(new OsuReplayFrame(timeStart, CirclePosition(timeStart, 3) + SPINNER_CENTRE, ToAction(isLeft)));
+                        Vector2 spinnerPos = CirclePosition(timeStart, SPIN_RADIUS) + SPINNER_CENTRE;
+                        lastNonSpinnerPos = spinnerPos;
                         
-                        timeStart += 5;
+                        AddFrameToReplay(new OsuReplayFrame(timeStart, spinnerPos, ToAction(isLeft)));
+                        
+                        timeStart += 15;
                     }
+                }
+                
+                if(canRelease && (frame.Time - lastFrame.Time) > (ConfigReleaseWait + ConfigReactionTime/* + ConfigReactionAntiRebindTime*/))
+                {
+                    double time0 = lastFrame.Time + ConfigReleaseDelay;
+                    
+                    AddFrameToReplay(new OsuReplayFrame(time0, lastNonSpinnerPos));
+                    isLeft = null;
+                    canRelease = false;
+                    
+                    if(ConfigReactionTime > 0)
+                    {
+                        double timeUntilNextFrame = frame.Time - lastFrame.Time;
+                        double timeUntilNextFrameAfterRelease = timeUntilNextFrame - ConfigReleaseDelay;
+                        
+                        if(timeUntilNextFrame > ConfigReactionTime &&
+                            timeUntilNextFrameAfterRelease > ConfigReactionTime)
+                        {
+                            double time1 = lastFrame.Time + ConfigReleaseDelay + ConfigReactionAntiRebindOffset;
+                            double time2 = frame.Time - ConfigReactionTime - ConfigReactionAntiRebindOffset;
+                            double time3 = frame.Time - ConfigReactionTime;
+                            
+                            if(time0 < time3)
+                            {
+                                if(time1 < time3)
+                                {
+                                    AddFrameToReplay(new OsuReplayFrame(time1, lastNonSpinnerPos));
+                                    
+                                    if(time1 < time2)
+                                        AddFrameToReplay(new OsuReplayFrame(time2, lastNonSpinnerPos));
+                                }
+                                
+                                AddFrameToReplay(new OsuReplayFrame(time3, lastNonSpinnerPos));
+                            }
+                        }
+                    }
+                }
+                
+                if(frame.IsSpinnerStart)
+                {
+                    isLeft = isLeft ?? true;
+                    isSpinning = true;
+                    canRelease = false;
+                    
+                    // Do not process spinner start event any further, as
+                    //  the position field is invalid
+                    lastFrame = frame;
+                    continue;
                 }
                 
                 if(frame.IsSpinnerEnd)
@@ -80,15 +221,9 @@ namespace osu.Game.Rulesets.Osu.Replays
                     // Do not process the spinner end event any further, as
                     //  the position field is invalid
                     isSpinning = false;
+                    canRelease = true;
                     lastFrame = frame;
                     continue;
-                }
-                
-                if(canRelease && (frame.Time - lastFrame.Time) > 150) //TODO: unhardcode
-                {
-                    AddFrameToReplay(new OsuReplayFrame(lastFrame.Time + 50, lastFrame.Position));
-                    isLeft = null;
-                    canRelease = false;
                 }
                 
                 if(frame.IsEngage || (!isLeft.HasValue && frame.IsHold))
@@ -106,9 +241,8 @@ namespace osu.Game.Rulesets.Osu.Replays
                 
                 
                 lastFrame = frame;
+                lastNonSpinnerPos = frame.Position;
             }
-            
-            return Replay;
         }
         
         private static OsuAction[] ToAction(bool? isLeft)
@@ -121,7 +255,9 @@ namespace osu.Game.Rulesets.Osu.Replays
             else
                 return new[] { OsuAction.RightButton };
         }
+        #endregion
         
+        #region HitObject to Abstract Timing Event calculation
         private List<AbstractEventFrame> GenerateTree()
         {
             List<AbstractEventFrame> frames = new List<AbstractEventFrame>();
@@ -150,6 +286,8 @@ namespace osu.Game.Rulesets.Osu.Replays
             double? spinnerEnd = null;
             // Last time the sliders were updated
             double? lastSliderTime = null;
+            // Whether slider following is currently engage-able or not
+            bool isSliderFollowing = ConfigFollowSlider;
             
             //HACK: remove the extra loop after the refactor
             for(int _homIndex = 0; _homIndex <= homCount; _homIndex++)
@@ -194,7 +332,7 @@ namespace osu.Game.Rulesets.Osu.Replays
                 // Update sliders as needed
                 if(lastSliderTime.HasValue && (time > lastSliderTime.Value || hitObject == null))
                 {
-                    double lastUpdateTime = lastSliderTime.Value;
+                    double lastUpdateTime = time;
                     
                     if(hitObject == null)
                     {
@@ -213,10 +351,43 @@ namespace osu.Game.Rulesets.Osu.Replays
                     {
                         SliderTracker tracker = sliders[i];
                         
+                        // Disable slider following if the current hit object
+                        //  were to happen during slider slide (that is, before the slider end)
+                        if(isSliderFollowing && time < tracker.Slider.EndTime)
+                            isSliderFollowing = false;
+                        
                         while(tracker.NextUpdateTime < lastUpdateTime)
                         {
                             double lastTime = tracker.NextUpdateTime;
                             Vector2 lastPos = tracker.NextPosition;
+                            
+                            // Note: it's valid to place slider following code here, as
+                            //  there are checks to prevent hit objects interrupting slider following
+                            if(isSliderFollowing)
+                            {
+                                double sliderStart = tracker.Slider.StartTime;
+                                double sliderLength = tracker.Slider.EndTime - sliderStart;
+                                
+                                double followingTime = Math.Max(lastSliderTime.Value, sliderStart) + SLIDER_FOLLOW_TICKS;
+                                
+                                
+                                while(followingTime < lastTime)
+                                {
+                                    double progress = (followingTime - sliderStart)  / sliderLength;
+                                    
+                                    Vector2 posAtProgress = tracker.Slider.StackedPositionAt(progress);
+                                    
+                                    AddFrame(frames, new AbstractEventFrame()
+                                    {
+                                        Time = followingTime,
+                                        Position = posAtProgress,
+                                        
+                                        IsSliderSlide = true
+                                    });
+                                    
+                                    followingTime += SLIDER_FOLLOW_TICKS; //TODO: adjust framerate based on mods
+                                }
+                            }
                             
                             AddFrame(frames, new AbstractEventFrame()
                             {
@@ -266,9 +437,16 @@ namespace osu.Game.Rulesets.Osu.Replays
                     }
                     
                     if(sliders.Count != 0)
-                        lastSliderTime = time;
+                    {
+                        lastSliderTime = lastUpdateTime;
+                    }
                     else
+                    {
                         lastSliderTime = null;
+                        
+                        // Reset slider followability
+                        isSliderFollowing = ConfigFollowSlider;
+                    }
                 }
                 
                 if(hitObject == null)
@@ -317,7 +495,15 @@ namespace osu.Game.Rulesets.Osu.Replays
                     });
                     
                     if(!lastSliderTime.HasValue)
+                    {
+                        // Enable slider follow checking
                         lastSliderTime = slider.StartTime;
+                    }
+                    else
+                    {
+                        // Can't follow multiple sliders at once
+                        isSliderFollowing = false;
+                    }
                     
                     continue;
                 }
@@ -325,7 +511,7 @@ namespace osu.Game.Rulesets.Osu.Replays
                 AddFrame(frames, new AbstractEventFrame()
                 {
                     Time = hitObject.StartTime,
-                    Position = hitObject.StackedPosition, //HACK: this is nasty
+                    Position = hitObject.StackedPosition,
                     
                     IsCircleHit = true,
                     
@@ -344,7 +530,9 @@ namespace osu.Game.Rulesets.Osu.Replays
             if(index < 0)
                 index = ~index;
             
+#if DEBUG
             //Log.Log("HOM " + index.ToString("000") + ": " + frame);
+#endif
             
             frames.Insert(index, frame);
         }
@@ -359,7 +547,9 @@ namespace osu.Game.Rulesets.Osu.Replays
             {
                 AbstractEventFrame currentFrameRef = frames[i];
                 
+#if DEBUG
                 Log.Log("ROM " + i.ToString("00000") + ": " + currentFrameRef);
+#endif
                 
                 // On slider entry
                 if(currentFrameRef.IsSliderTick && currentFrameRef.IsSliderSlide && currentFrameRef.IsCircleHit)
@@ -506,8 +696,9 @@ namespace osu.Game.Rulesets.Osu.Replays
                 }
             }
         }
+        #endregion
         
-        private class AbstractEventFrame : IComparable<AbstractEventFrame>
+        protected class AbstractEventFrame : IComparable<AbstractEventFrame>
         {
             public static readonly IComparer<AbstractEventFrame> Comparer = Comparer<AbstractEventFrame>.Default;
             
@@ -515,7 +706,7 @@ namespace osu.Game.Rulesets.Osu.Replays
             public Vector2 Position = default; // Not valid if only IsSpinner or IsSpinnerEnd is set
             
             public bool IsEngage => IsCircleHit;
-            public bool IsHold => IsSliderSlide || IsSliderTick || IsSpinnerStart;
+            public bool IsHold => IsSliderSlide /*|| IsSliderTick*/ || IsSpinnerStart;
             public bool IsRelease => (IsCircleHit || IsSliderEnd || IsSpinnerEnd) && !IsHold;
             
             public bool IsCircleHit = false;
